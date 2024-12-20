@@ -1,5 +1,5 @@
 # Achieving Zero-Downtime PHP-FPM Restarts and Atomic Updates
-A PoC for achieving Zero-Downtime PHP-FPM restarts and Atomic Updates
+PHP-FPM (FastCGI Process Manager) is a powerful solution for managing PHP processes, but it poses challenges when updating PHP applications or configurations without impacting active requests. If a slow child lingers, incoming requests queue up, causing delays for the duration of the timeout. This delay can lead to significant downtime, especially for high-traffic applications. You can read more detailed info at the [blog page](https://blog.famzah.net/2024/12/20/achieving-zero-downtime-php-fpm-restarts-and-atomic-updates/).
 
 # Setup
 First clone this repository to a local directory. If you want to start ASAP, then clone to the same location as mine - ```/home/famzah/php-fpm-graceful```. It doesn't matter if the real UNIX user is "famzah".
