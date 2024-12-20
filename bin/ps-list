@@ -1,0 +1,4 @@
+#!/bin/bash
+set -u
+
+ps axfuww|grep php-fpm|grep -v grep

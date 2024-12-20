@@ -1,0 +1,7 @@
+#!/bin/bash
+set -u
+
+while true; do
+	curl -sS -m 2 http://localhost:82/ping.php | grep -q -P '^pong[12]$' || echo ping-failed
+	echo -n .
+done

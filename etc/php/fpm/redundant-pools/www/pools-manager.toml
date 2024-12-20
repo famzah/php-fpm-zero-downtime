@@ -1,0 +1,31 @@
+[apache]
+
+manager_url = "http://localhost:82/balancer-manager"
+balancer_name = "phpfpmlb"
+
+# Maps Apache BalancerMember URLs to PHP-FPM redundant pools.
+# The order is critical: the first URL corresponds to PHP-FPM "1.conf",
+# the second to "2.conf", and so on.
+member_urls = ["fcgi://pool-1", "fcgi://pool-2"]
+
+[php]
+
+monitor_url = "http://localhost:82/ping-php-fpm"
+
+php_fpm_cmd = [
+	"sudo", "-u", "%CURRENT_USER%",
+	"/usr/sbin/php-fpm8.1",
+	"-p", "%CURRENT_DIR%"
+]
+
+# "current_dir" must match the DocumentRoot path in the Apache configuration
+current_dir = "/home/famzah/php-fpm-graceful/www/current"
+
+# Symlink path that points to the current release directory.
+#
+# If "current_release_symlink" is empty,
+#   "current_dir" above is not used and no further action is taken.
+# If "current_release_symlink" is set,
+#   the directory it points to is atomically mounted over "current_dir" on each PHP-FPM start.
+#   In this case, "current_dir" must be empty beforehand.
+current_release_symlink = "/home/famzah/php-fpm-graceful/www/current.release"

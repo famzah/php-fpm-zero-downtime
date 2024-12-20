@@ -1,0 +1,241 @@
+#!/usr/bin/python3
+
+import argparse
+import requests
+from bs4 import BeautifulSoup
+import sys
+import urllib.parse
+from pprint import pprint
+import re
+import json
+
+def fetch_and_parse_balancer_status(manager_url, balancer_name):
+#    try:
+    # Fetch the HTML content
+    response = requests.get(manager_url, headers={"Referer": manager_url})
+    response.raise_for_status()
+    html_content = response.text
+#    except requests.exceptions.RequestException as e:
+#        sys.exit(f"Error fetching URL: {e}")
+
+    # Parse the HTML content
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # Extract all balancer sections
+    balancers = soup.find_all("h3")
+    parsed_balancers = {}
+
+    for balancer in balancers:
+        balancer_info = {}
+
+        # Ensure the <h3> starts with "LoadBalancer Status for "
+        if not balancer.get_text().startswith("LoadBalancer Status for "):
+            continue
+
+        # Find the <a> tag inside the <h3> and extract its href attribute
+        link_tag = balancer.find("a")
+        if not link_tag or not link_tag.has_attr("href"):
+            continue
+
+        a_info = urllib.parse.urlsplit(link_tag["href"])
+        balancer_meta = urllib.parse.parse_qs(a_info.query)
+        balancer_nonce = balancer_meta['nonce'][0]
+
+        balancer_info["Meta"] = {
+            'Nonce': balancer_nonce,
+        }
+
+        # Only proceed if the balancer name matches the "b" parameter
+        if balancer_name != balancer_meta['b'][0]:
+           continue
+
+        del balancer_meta
+
+        # Extract main table (MaxMembers, StickySession, etc.)
+        main_table = balancer.find_next("table")
+        main_headers = [th.get_text(strip=True) for th in main_table.find("tr").find_all("th")]
+        main_data = [td.get_text(strip=True) for td in main_table.find("tr").find_next_sibling("tr").find_all("td")]
+        balancer_info["Main"] = dict(zip(main_headers, main_data))
+
+        # Extract worker table
+        worker_table = main_table.find_next("table")
+        worker_headers = [th.get_text(strip=True) for th in worker_table.find("tr").find_all("th")]
+        workers = []
+        for row in worker_table.find_all("tr")[1:]:
+            worker_data = [td.get_text(strip=True) for td in row.find_all("td")]
+            workers.append(dict(zip(worker_headers, worker_data)))
+
+        balancer_info["Workers"] = workers
+        parsed_balancers[balancer_name] = balancer_info
+
+    return parsed_balancers
+
+# Function to validate keys and values
+def validate_keys(expected, actual, key_base = ''):
+    for key, value in expected.items():
+        if key not in actual:
+            sys.exit(f"Key '{key_base}{key}' is missing.")
+        if isinstance(value, dict):
+            # Recursively validate nested dictionaries
+            validate_keys(value, actual[key], f'{key_base}{key} => ')
+        elif actual[key] != value:
+            sys.exit(f"Key '{key_base}{key}' has value '{actual[key]}', expected '{value}'.")
+
+def validate_balancer(result, balancer_name):
+    main_expected_values = {
+        balancer_name: {
+            'Main': {
+                'Active': 'Yes',
+                'DisableFailover': 'Off',
+                'Method': 'bybusyness',
+                'StickySession': '(None)',
+            }
+        }
+    }
+
+    validate_keys(main_expected_values, result)
+
+    members_line = result[balancer_name]['Main']['MaxMembers']
+    m = re.match(r'^\s*(\d+)\s*\[\s*(\d+)\s*Used\s*\]\s*$', members_line)
+    if not m:
+        sys.exit(f'Unable to parse Main->MaxMembers: {members_line}')
+
+    max_members = int(m.group(1))
+    used_members = int(m.group(2))
+
+    if max_members != used_members:
+        sys.exit(f'Unexpected value for Main->MaxMembers: {members_line}')
+
+    workers_count = len(result[balancer_name]['Workers'])
+    if workers_count != used_members:
+        sys.exit(f'Unexpected value for Main->MaxMembers: {members_line} vs. workers_count = {workers_count}')
+
+    for worker in result[balancer_name]['Workers']:
+        if worker['Status'] not in ['Init Ok', 'Init Drn Ok']:
+            sys.exit('Unexpected Status "{}" for worker "{}"'.format(
+                worker['Status'], worker['Worker URL']
+            ))
+
+def parse_argv():
+    parser = argparse.ArgumentParser(description="Fetch and parse balancer manager status.")
+    parser.add_argument("manager_url", help="URL of the balancer manager page")
+    parser.add_argument("balancer_name", help="Name of the balancer to fetch information for")
+    
+    # Add subparsers for commands
+    subparsers = parser.add_subparsers(dest="command", required=True, help="Command to execute")
+
+    subparsers.add_parser("show", help="Show balancer information")
+    #subparsers.add_parser("check", help="Assert balancer status is as expected")
+
+    lw_parser = subparsers.add_parser("list-workers", help="List the URL of each worker")
+    lw_parser.add_argument("-q", "--quiet", action="store_true",
+        help="Show just the URLs without additional info")
+    lw_parser.add_argument("-s", "--status", choices=['ok', 'draining'], default=None,
+        help="Show only healthy workers")
+
+    drain_parser = subparsers.add_parser("set-drain", help="Manage Drain for a worker")
+    drain_parser.add_argument("status", choices=['on', 'off'], help='Either "on" or "off"')
+    drain_parser.add_argument("worker_url", help="URL of the worker to drain")
+
+    busy_parser = subparsers.add_parser("get-stats", help="Show particular info for a worker")
+    busy_parser.add_argument("key", help="Stats key")
+    busy_parser.add_argument("worker_url", help="URL of the worker")
+
+    return parser.parse_args()
+
+def split_UDS_and_URL(url):
+    socket = None
+
+    m = re.match(r'^unix:([^\\]+)\|(.+)$', url)
+    if m:
+        url = m.group(2)
+        socket = m.group(1)
+
+    return url, socket
+
+def list_workers(result, args):
+    sorted_workers = sorted( # display Draining first
+        result[args.balancer_name]['Workers'],
+        key=lambda worker: (worker['Status'] != 'Init Drn Ok', worker['Worker URL'])
+    )
+
+    for worker in sorted_workers:
+        if args.status:
+            if args.status == 'ok' and worker['Status'] != 'Init Ok':
+                continue
+            if args.status == 'draining' and worker['Status'] != 'Init Drn Ok':
+                continue
+
+        url, socket = split_UDS_and_URL(worker['Worker URL'])
+
+        print(url, end='')
+
+        if not args.quiet:
+            print(' Status="{}"'.format(worker['Status']), end='')
+            if socket:
+                print(' socket="{}"'.format(socket), end='')
+        print()
+
+def find_worker(result, worker_url, balancer_name):
+    ret = None
+
+    online = {}
+
+    for worker in result[balancer_name]['Workers']:
+        url, socket = split_UDS_and_URL(worker['Worker URL'])
+        online[url] = (worker['Status'] == 'Init Ok')
+        if url == worker_url:
+            ret = worker, url
+
+    if ret is None:
+        sys.exit(f'Unable to find worker with URL {worker_url}')
+
+    return (*ret, online)  # append online
+
+def manage_worker_drain(result, args):
+    worker, url, online = find_worker(result, args.worker_url, args.balancer_name)
+
+    data = {
+        'w': url,
+        'b': args.balancer_name,
+        'nonce': result[args.balancer_name]['Meta']['Nonce'],
+        'w_status_N': '1' if args.status == 'on' else '0',
+    }
+
+    if args.status == 'on':
+        if online[url]:
+            online[url] = False
+            if sum(status == True for status in online.values()) < 1:
+                sys.exit('Refusing to drain the last online worker')
+
+    response = requests.post(args.manager_url, headers={"Referer": args.manager_url}, data=data)
+    response.raise_for_status()
+
+def print_worker_stats(result, args):
+    worker, _, _ = find_worker(result, args.worker_url, args.balancer_name)
+    try:
+        print(worker[args.key])
+    except KeyError:
+        sys.exit(f'Unknown stats key "{args.key}"')
+
+def main():
+    args = parse_argv()
+
+    result = fetch_and_parse_balancer_status(args.manager_url, args.balancer_name)
+    if not result:
+        sys.exit(f"No data found for balancer '{args.balancer_name}'")
+
+    if args.command != 'show':
+        validate_balancer(result, args.balancer_name)
+
+    if args.command == 'show':
+        print(json.dumps(result, sort_keys=True, indent=4))
+    if args.command == 'list-workers':
+        list_workers(result, args)
+    if args.command == 'set-drain':
+        manage_worker_drain(result, args)
+    if args.command == 'get-stats':
+        print_worker_stats(result, args)
+
+if __name__ == "__main__":
+    main()

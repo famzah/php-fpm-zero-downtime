@@ -1,0 +1,11 @@
+#!/bin/bash
+set -u
+
+while true; do
+	res="$(curl -sS -m 7 http://localhost:82/sleep-long.php)"
+	grep -q -P '^ver[12]: Success' <<<"$res" || {
+		echo "sleep-failed: $res"
+		continue
+	}
+	echo -n .
+done

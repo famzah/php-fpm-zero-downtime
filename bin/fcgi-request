@@ -1,0 +1,34 @@
+#!/bin/bash
+set -u
+
+[ "$#" -eq 2 ] || {
+	echo "Usage: $0 URL_PATH SOCKET"
+	echo
+	echo "Example: $0 /status /var/run/php-fpm/www.sock"
+	exit 1
+} >&2
+
+req="$1" ; shift
+socket="$1" ; shift
+
+# Extract the part before "?"
+part1="${req%%\?*}"  # Everything before "?"
+# Extract the part after "?"
+part2="${req#*\?}"   # Everything after "?"
+
+#cwd="$(pwd)"
+#export SCRIPT_NAME="$cwd/$part1"
+#export SCRIPT_FILENAME="$cwd/$part1"
+
+export SCRIPT_NAME="$part1"
+export SCRIPT_FILENAME="$part1"
+export REQUEST_METHOD=GET
+export QUERY_STRING="$part2"
+
+cgi-fcgi -bind -connect "$socket"
+ec="$?"
+
+[ "$ec" -eq 0 ] && exit 0
+
+echo "cgi-fcgi: ERROR code $ec" >&2
+exit "$ec"

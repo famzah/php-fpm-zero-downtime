@@ -1,0 +1,25 @@
+#!/bin/bash
+set -u
+
+# XXX: This script runs as "root" in a separate mount user-namespace !!!
+
+release_dir="$1" ; shift
+current_dir="$1" ; shift
+php_fpm_start_cmd=("$@")
+
+# ensure changes do not affect the host (main) mount namespace
+# XXX: This stops the propagation of the HOST (MAIN) to our private namespace, too!
+#	mount --make-rprivate / || {
+#		echo 'Error: Failed to --make-rprivate' >&2
+#		exit 1
+#	}
+
+mount --bind "$release_dir" "$current_dir" || {
+	echo "Error: Failed to remount $current_dir to $release_dir" >&2
+	exit 1
+}
+
+#ls -la $current_dir
+#findmnt --target $current_dir
+
+exec "${php_fpm_start_cmd[@]}"

@@ -1,0 +1,534 @@
+#!/usr/bin/python3 -u
+
+import argparse
+import tomli
+import os
+import sys
+import os.path
+from pprint import pprint
+import re
+import signal
+import time
+import subprocess
+import pwd
+import json
+
+apache_balancer_manager_bin = 'bin/balancer-manager'
+
+def parse_apache_backend_config(config, pool, replica_count, replica_conf_dir, manager_conf):
+    apache_config = config.get("apache", None)
+    if not apache_config:
+        return False
+
+    pool['backend_type'] = 'apache'
+
+    for key in ['manager_url', 'balancer_name', 'member_urls']:
+        value = apache_config.get(key, '')
+        if not len(value):
+            sys.exit(f'Error: Apache "{key}" is empty in "{manager_conf}"')
+        pool['backend_config'][key] = value
+
+    cfg_replica_count = len(pool['backend_config']['member_urls'])
+    if cfg_replica_count != replica_count:
+        sys.exit(
+            f'Error: Apache "member_urls" count of {cfg_replica_count} in "{manager_conf}" ' +
+            f'!= count of {replica_count} in "{replica_conf_dir}"'
+        )
+
+    return True
+
+def get_all_pools(args):
+    pools = {}
+
+    conf_dir = 'etc/php/fpm/redundant-pools'
+
+    directories = sorted(
+        [entry.name for entry in os.scandir(conf_dir) if entry.is_dir()]
+    )
+
+    for pool_name in directories:
+        pools[pool_name] = {}
+        pools[pool_name]['backend_config'] = {}
+
+        manager_conf = f'{conf_dir}/{pool_name}/pools-manager.toml'
+        with open(manager_conf, "rb") as file:
+            config = tomli.load(file)
+
+        replica_conf_dir = f'{conf_dir}/{pool_name}'
+        for conf_num in range(1, 20):
+            if not os.path.isfile(f'{replica_conf_dir}/{conf_num}.conf'):
+                break
+        pools[pool_name]['replica_count'] = conf_num - 1
+
+        res = False
+        res |= parse_apache_backend_config(
+            config, pools[pool_name],
+            pools[pool_name]['replica_count'], replica_conf_dir,
+            manager_conf
+        )
+        if not res:
+            sys.exit(f'Error: No proxy backend is configured in "{manager_conf}"')
+
+    return pools, config
+
+def get_pid_from_pid_file(pool_name, replica_id):
+    pid_file = f'pid/php-fpm-{pool_name}{replica_id}.pid'
+
+    try:
+        with open(pid_file) as f:
+            pid = f.read()
+    except FileNotFoundError:
+        print(f'  PID file "{pid_file}" not found. This PHP-FPM master has already been terminated?',
+            file=sys.stderr
+        )
+        return None, pid_file
+
+    if not re.search(r'^\d+$', pid):
+        sys.exit(f'  Error: PID file "{pid_file}" contains non-digit data: {pid}')
+    pid = int(pid)
+
+    # simple sanity check; let's hope that PHP won't change the "cmdline" description
+    with open(f'/proc/{pid}/cmdline') as f:
+        desc = f.read()
+    desc = desc.replace('\0', ' ').strip()
+    if 'php-fpm: master process' not in desc:
+        sys.exit(f'  Error: PID file "{pid_file}" contains a PID which doesn\'t belong to a PHP-FPM master: "{desc}"')
+
+    return pid, pid_file
+
+def signal_php_fpm(pool_name, replica_id, signum, timeout):
+    pid, pid_file = get_pid_from_pid_file(pool_name, replica_id)
+
+    if pid is None:
+        return
+
+    # XXX: If PHP-FPM works under another UNIX user,
+    #      it's highly recommended that you "sudo" to it first.
+    
+    os.kill(pid, signum)
+
+    done = False
+    for i in range(1, timeout+1):
+        if os.path.exists(pid_file):
+            print('.', end='')
+            time.sleep(1)
+        else:
+            done = True
+            break
+
+    print(' ', end='')
+    if done:
+        print('[OK]')
+    else:
+        print('[FAILED] Timeout waiting for the process to terminate')
+
+    if not done:
+        sys.exit(f'Error: Operation failed')
+
+def start_php_fpm(pool_name, replica_id, manager_config):
+    current_user = pwd.getpwuid(os.getuid()).pw_name
+    current_dir = os.getcwd()
+
+    command = []
+    for cmd in manager_config['php']['php_fpm_cmd']:
+        command.append(
+            cmd.replace('%CURRENT_USER%', current_user).replace('%CURRENT_DIR%', current_dir)
+        )
+
+    del current_user
+    del current_dir
+
+    command.extend(['--fpm-config', f'etc/php/fpm/redundant-pools/{pool_name}/{replica_id}.conf'])
+
+    current_release_symlink = manager_config['php'].get('current_release_symlink', '')
+    if len(current_release_symlink):
+        current_dir = manager_config['php'].get('current_dir', '')
+        if not len(current_dir):
+            sys.exit('Error: [php]->[current_dir] must be configured when [php]->[current_release_symlink] is enabled')
+
+        try:
+            release_dir = os.readlink(current_release_symlink)
+        except:
+            sys.exit(f'Error: The [php]->[current_release_symlink] file is not existing or is not a symlink: {current_release_symlink}')
+
+        files_in_current_dir = len(os.listdir(current_dir))
+        if files_in_current_dir != 0:
+            sys.exit(f'Error: {files_in_current_dir} file(s) were found in the "current_dir" but it must be empty: {current_dir}')
+
+        command = [
+            'sudo', 'unshare', '--mount', 'lib/unshare-wrapper',
+            release_dir, current_dir
+        ] + command
+
+    result = subprocess.run(command, check=False)
+    
+    done = False
+    if result.returncode == 0:
+        done = True
+
+    print(' ', end='')
+    if done:
+        print('[OK]')
+    else:
+        print('[FAILED]')
+
+    if not done:
+        sys.exit(f'Error: Operation failed')
+
+def lb_list_replicas(config):
+    if config['backend_type'] == 'apache':
+        command = [
+            apache_balancer_manager_bin,
+            config['backend_config']['manager_url'],
+            config['backend_config']['balancer_name'],
+            'list-workers', '-q'
+        ]
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
+        if result.returncode != 0:
+            sys.exit(f'Error: "{apache_balancer_manager_bin}" returned non-OK exit code {result.returncode}')
+        lb_replicas_list = result.stdout.splitlines()
+    else:
+        raise Exception('Unimplemented backend: {}'.format(config['backend_type']))
+
+    if sorted(lb_replicas_list) != sorted(config['backend_config']['member_urls']):
+        sys.exit('Error: Load balancer list vs. config list difference: "{}" vs. "{}"'.format(
+            sorted(lb_replicas_list), sorted(config['backend_config']['member_urls'])
+        ))
+
+    # return tuples (value from lb_replicas_list, index+1 in config)
+    return [(value, config['backend_config']['member_urls'].index(value)+1) for value in lb_replicas_list]
+
+def get_value_by_index_from_tuples(tuples_list, search_index):
+    for value, index in tuples_list:
+        if index == search_index:
+            return value
+    raise ValueError(f'Index {search_index} not found in the list of tuples')
+
+def lb_manage_drain(lb_drain_value, config, lb_replica_list, replica_id, timeout):
+    worker_url = get_value_by_index_from_tuples(lb_replica_list, replica_id)
+
+    if config['backend_type'] == 'apache':
+        if lb_drain_value:
+            lb_drain_value = 'on'
+            lb_expected_status = 'Init Drn Ok'
+        else:
+            lb_drain_value = 'off'
+            lb_expected_status = 'Init Ok'
+
+        command = [
+            apache_balancer_manager_bin,
+            config['backend_config']['manager_url'],
+            config['backend_config']['balancer_name'],
+            'set-drain', lb_drain_value,
+            worker_url
+        ]
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            sys.exit(f'Error: "{apache_balancer_manager_bin}" returned non-OK exit code {result.returncode}')
+    else:
+        raise Exception('Unimplemented backend: {}'.format(config['backend_type']))
+
+    done = False
+    drain_status_ok = False
+    last_drain_status = 'unknown'
+    is_busy = True
+    last_busy_status = 'unknown'
+    for i in range(1, timeout+1):
+        if not drain_status_ok:
+            if config['backend_type'] == 'apache':
+                command = [
+                    apache_balancer_manager_bin,
+                    config['backend_config']['manager_url'],
+                    config['backend_config']['balancer_name'],
+                    'get-stats', 'Status',
+                    worker_url
+                ]
+                result = subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
+                if result.returncode != 0:
+                    sys.exit(f'Error: "{apache_balancer_manager_bin}" returned non-OK exit code {result.returncode}')
+                last_drain_status = result.stdout.strip()
+                if last_drain_status == lb_expected_status:
+                    drain_status_ok = True
+                else:
+                    print('x', end='')
+                    time.sleep(1)
+                    continue
+            else:
+                raise Exception('Unimplemented backend: {}'.format(config['backend_type']))
+
+        if is_busy:
+            if config['backend_type'] == 'apache':
+                command = [
+                    apache_balancer_manager_bin,
+                    config['backend_config']['manager_url'],
+                    config['backend_config']['balancer_name'],
+                    'get-stats', 'Busy',
+                    worker_url
+                ]
+                result = subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
+                if result.returncode != 0:
+                    sys.exit(f'Error: "{apache_balancer_manager_bin}" returned non-OK exit code {result.returncode}')
+                last_busy_status = result.stdout.strip()
+                if last_busy_status == '0':
+                    is_busy = False
+                else:
+                    print('.', end='')
+                    time.sleep(1)
+                    continue
+            else:
+                raise Exception('Unimplemented backend: {}'.format(config['backend_type']))
+
+        if drain_status_ok and not is_busy:
+            done = True
+            break
+
+    print(' ', end='')
+    if done:
+        print('[OK]')
+    else:
+        print('[FAILED] Timeout waiting for the Load balancer to react: Status="{}", Busy="{}"'.format(
+            last_drain_status, last_busy_status
+        ))
+
+    if not done:
+        sys.exit(f'Error: Operation failed')
+
+def get_lb_status(config, lb_replica_list, replica_id):
+    worker_url = get_value_by_index_from_tuples(lb_replica_list, replica_id)
+
+    if config['backend_type'] == 'apache':
+        command = [
+            apache_balancer_manager_bin,
+            config['backend_config']['manager_url'],
+            config['backend_config']['balancer_name'],
+            'get-stats', 'Status',
+            worker_url
+        ]
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
+        if result.returncode != 0:
+            sys.exit(f'Error: "{apache_balancer_manager_bin}" returned non-OK exit code {result.returncode}')
+
+        lb_status_text = result.stdout.strip()
+        lb_status_ok = lb_status_text == 'Init Ok'
+
+        return lb_status_ok, lb_status_text
+    else:
+        raise Exception('Unimplemented backend: {}'.format(config['backend_type']))
+
+def get_php_fpm_status(pool_name, replica_id):
+    fcgi_request_bin = 'bin/fcgi-request'
+    command = [
+        fcgi_request_bin, '/ping-php-fpm',
+        f'sockets/php-fpm-{pool_name}{replica_id}.sock'
+    ]
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        sys.exit(f'Error: "{fcgi_request_bin}" returned non-OK exit code {result.returncode}')
+
+    ping_status_text = result.stdout.strip().splitlines()[-1]
+    ping_status_ok = ping_status_text == 'pong'
+
+    return ping_status_ok, ping_status_text
+
+def get_mount_status(pool_name, replica_id, manager_config):
+    pid, pid_file = get_pid_from_pid_file(pool_name, replica_id)
+    if pid is None:
+        sys.exit(f'Error: PID file not found: {pid_file}')
+
+    current_dir = manager_config['php'].get('current_dir', '')
+
+    command = [
+        'findmnt', '--task', str(pid), '--json', '--mountpoint', current_dir
+    ]
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        sys.exit(f'Error: "nsenter" returned non-OK exit code {result.returncode}')
+
+    data = json.loads(result.stdout)
+    if len(data['filesystems']) != 1:
+        sys.exit('Error: findmnt: Unexpected count of results: {}'.format(data))
+    for fs in data['filesystems']:
+        if fs['target'] != current_dir:
+            sys.exit('Error: findmnt: fs[target]="{}" vs. current_dir="{}"'.format(
+                fs['target'], current_dir
+            ))
+        m = re.search(r'^([^\[]+)\[([^\]]+)\]$', fs['source'])
+        if not m:
+            sys.exit('Error: findmnt: Unable to parse "{}"'.format(fs['source']))
+        mount_status_text = m.group(2)
+
+    return mount_status_text
+
+def show_status(config, lb_replica_list, pool_name, replica_id, manager_config, quiet):
+    lb_status_ok, lb_status_text = get_lb_status(config, lb_replica_list, replica_id)
+    ping_status_ok, ping_status_text = get_php_fpm_status(pool_name, replica_id)
+    mount_status_text = get_mount_status(pool_name, replica_id, manager_config)
+
+    final_ok = True
+    final_ok &= lb_status_ok
+    final_ok &= ping_status_ok
+
+    if not quiet:
+        verb_info = '  (LB="{}", ping_php="{}", current="{}")'.format(
+            lb_status_text, ping_status_text, mount_status_text
+        )
+    else:
+        verb_info = ''
+
+    print('[{}]{}'.format(
+        'OK' if final_ok else 'Error', verb_info
+    ))
+
+    return final_ok, mount_status_text
+
+def control_pools(args, pools, manager_config, do_start, do_stop, do_drain_lb, do_status):
+    found_selected_pool = False
+    status_final_ok = True
+    status_mounts_set = set()
+    for pool_name, config in sorted(pools.items()):
+        if args.pool_selector == 'single':
+            if args.pool_name != pool_name:
+                continue
+
+        found_selected_pool = True
+        print(f'Redundant pool "{pool_name}"...')
+
+        if not hasattr(args, 'timeout'):
+            timeout = 60
+        else:
+            timeout = args.timeout
+
+        if args.pool_selector == 'single' and args.replica_id is not None:
+            if args.replica_id < 1 or args.replica_id > config['replica_count']:
+                sys.exit(f'  Error: Replica ID for this pool must be between 1 and {config["replica_count"]}')
+
+        if do_drain_lb or do_status: # non-OK replica workers are listed first
+            lb_replica_list = lb_list_replicas(config)
+            replica_order = [index for _, index in lb_replica_list]
+        else:
+            replica_order = range(1, config['replica_count'] + 1)
+
+        for replica_id in replica_order:
+            if args.pool_selector == 'single' and args.replica_id is not None:
+                if replica_id != args.replica_id:
+                    continue
+
+            if do_drain_lb:
+                print(f'  Deactivating the load balancer for replica {replica_id} ', end='')
+                lb_manage_drain(True, config, lb_replica_list, replica_id, timeout)
+            if do_stop:
+                print(f'  Stopping replica {replica_id} ', end='')
+                signal_php_fpm(pool_name, replica_id, signal.SIGTERM, timeout)
+            if do_start:
+                print(f'  Starting replica {replica_id} ', end='')
+                start_php_fpm(pool_name, replica_id, manager_config)
+            if do_drain_lb:
+                print(f'  Activating the load balancer for replica {replica_id} ', end='')
+                lb_manage_drain(False, config, lb_replica_list, replica_id, timeout)
+            if do_status:
+                print(f'  Status for replica {replica_id} ', end='')
+                status_final_ok, mount_dir = show_status(
+                    config, lb_replica_list, pool_name, replica_id, manager_config,
+                    args.quiet
+                )
+                status_mounts_set.add(mount_dir)
+
+    if args.pool_selector == 'single' and not found_selected_pool:
+        sys.exit(f'Error: Redundant pool "{args.pool_name}" not found')
+    if do_status:
+        if len(status_mounts_set) != 1:
+            sys.exit(f'Error: Different mounts for "current" found: {status_mounts_set}')
+        if not status_final_ok:
+            sys.exit('Error: At least one error was found')
+
+def stop_command(args, pools, manager_config):
+    control_pools(args, pools, manager_config, False, True, False, False) # no-start, stop, no-drain-lb
+
+def start_command(args, pools, manager_config):
+    control_pools(args, pools, manager_config, True, False, False, False) # start, no-stop, no-drain-lb
+
+def restart_command(args, pools, manager_config):
+    control_pools(args, pools, manager_config, True, True, True, False) # start, stop, drain-lb
+
+def status_command(args, pools, manager_config):
+    control_pools(args, pools, manager_config, False, False, False, True) # status only
+
+def list_command(args, pools, manager_config):
+    for pool_name, config in sorted(pools.items()):
+        print(pool_name, end='')
+        if not args.quiet:
+            print(f' -> (replica_count="{config["replica_count"]}" ', end='')
+            print(f'backend="{config["backend_type"]}" ', end='')
+            print(' '.join(f'{key}="{value}"' for key, value in sorted(config['backend_config'].items())), end='')
+            print(')')
+        else:
+            print()
+
+def argv_add_timeout(parser):
+    parser.add_argument('--timeout', type=int, default=60,
+        help=f'Timeout for the stop operation in seconds; default is 60')
+
+def argv_start_stop_restart_parser(parent_subparsers, action_func, verb, verb_past, has_timeout, desc = None):
+    if desc is None:
+        desc = verb.capitalize()
+
+    cmd_parser = parent_subparsers.add_parser(verb,
+        help=f'{desc} all pools, one whole pool or just one replica of a pool')
+    subcmd_subparsers = cmd_parser.add_subparsers(title='Pool selector', dest='pool_selector',
+        required=False)
+
+    # verb -> all
+    pool_parser = subcmd_subparsers.add_parser('all',
+        help=f'If given, all pools are {verb_past}. This is the default')
+    if has_timeout:
+        argv_add_timeout(pool_parser)
+
+    # verb -> single
+    pool_parser = subcmd_subparsers.add_parser('single',
+        help=f'If given, only one pool or just one replica of the pool are {verb_past}')
+    pool_parser.add_argument('pool_name',
+        help=f'Pool name')
+    pool_parser.add_argument('replica_id', type=int, nargs='?',
+        help=f'Replica ID. If none is given, all are {verb_past}')
+    if has_timeout:
+        argv_add_timeout(pool_parser)
+
+    cmd_parser.set_defaults(func=action_func)
+
+    return cmd_parser
+
+def parse_argv():
+    # Main parser
+    parser = argparse.ArgumentParser(description="Service Management Tool")
+    subparsers = parser.add_subparsers(title="Commands", dest="command", required=True)
+    
+    # 'start' command
+    argv_start_stop_restart_parser(subparsers, start_command, 'start', 'started', False)
+    
+    # 'stop' command
+    argv_start_stop_restart_parser(subparsers, stop_command, 'stop', 'stopped', True)
+    
+    # 'restart' command
+    argv_start_stop_restart_parser(subparsers, restart_command, 'restart', 'restarted', True)
+    
+    # 'status' command
+    status_parser = argv_start_stop_restart_parser(
+        subparsers, status_command, 'status', 'shown', False, 'Show status for')
+    status_parser.add_argument("-q", "--quiet", action="store_true", help="Skip extra info")
+    
+    # 'list' command
+    list_parser = subparsers.add_parser("list", help="List all pools")
+    list_parser.add_argument("-q", "--quiet", action="store_true", help="Skip extra info")
+    list_parser.set_defaults(func=list_command)
+
+    # Parse arguments
+    args = parser.parse_args()
+
+    return args
+
+def main():
+    args = parse_argv()
+    pools, manager_config = get_all_pools(args)
+    args.func(args, pools, manager_config)  # Call the appropriate command function
+
+main()
